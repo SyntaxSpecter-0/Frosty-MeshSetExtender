@@ -18,7 +18,7 @@ using System.Windows;
 
 [assembly: PluginDisplayName("MeshSet Extender")]
 [assembly: PluginAuthor("Claymaver")]
-[assembly: PluginVersion("1.0.1.5")]
+[assembly: PluginVersion("1.0.1.9")]
 
 // ============================================
 // MeshSet Exporter

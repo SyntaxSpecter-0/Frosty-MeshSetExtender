@@ -1056,6 +1056,34 @@ namespace MeshSetExtender.Windows
             return result;
         }
 
+        /// <summary>
+        /// Builds updated ResMeta by preserving the existing metadata bytes and only
+        /// updating ByteSize (first 4 bytes) to the new content length.
+        /// </summary>
+        private static byte[] BuildUpdatedResMeta(ResAssetEntry entry, int contentLength)
+        {
+            byte[] meta = null;
+
+            if (entry?.ResMeta != null && entry.ResMeta.Length > 0)
+            {
+                meta = (byte[])entry.ResMeta.Clone();
+            }
+            else
+            {
+                meta = new byte[16];
+            }
+
+            if (meta.Length < 4)
+            {
+                var expanded = new byte[16];
+                Array.Copy(meta, expanded, meta.Length);
+                meta = expanded;
+            }
+
+            BitConverter.GetBytes((uint)contentLength).CopyTo(meta, 0);
+            return meta;
+        }
+
         private void GenerateButton_Click(object sender, RoutedEventArgs e)
         {
             if (_templateClothWrappingBytes == null || _templateEAClothBytes == null)
@@ -1081,6 +1109,39 @@ namespace MeshSetExtender.Windows
                 if (result != MessageBoxResult.Yes) return;
             }
 
+            // Writing to the resource we just read the template from destroys the template. The
+            // run still "succeeds", but every later run reads back the corrupted data, so the
+            // damage compounds silently. This happens whenever a duplicated mesh still points at
+            // the source mesh's cloth resources.
+            if (_targetClothWrappingEntry != null && _templateClothWrappingEntry != null &&
+                string.Equals(_targetClothWrappingEntry.Name, _templateClothWrappingEntry.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                var shared = FrostyMessageBox.Show(
+                    $"The target and template share one ClothWrapping resource:\n\n  {_targetClothWrappingEntry.Name}\n\n" +
+                    "Generating overwrites the template with the generated data, so every later run against this " +
+                    "template reads back the new data instead of the original. This usually means the target is a " +
+                    "duplicated asset that still references the source mesh's cloth.\n\n" +
+                    "Continue anyway?",
+                    "Target and template share a resource", MessageBoxButton.YesNo);
+                ClothLogger.LogWarning(
+                    $"Target and template both resolve to ClothWrapping '{_targetClothWrappingEntry.Name}' " +
+                    $"(user chose {(shared == MessageBoxResult.Yes ? "continue" : "cancel")}).");
+                if (shared != MessageBoxResult.Yes) return;
+            }
+
+            if (_targetEAClothEntry != null && _templateEAClothEntry != null &&
+                string.Equals(_targetEAClothEntry.Name, _templateEAClothEntry.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                var sharedEc = FrostyMessageBox.Show(
+                    $"The target and template share one EACloth resource:\n\n  {_targetEAClothEntry.Name}\n\n" +
+                    "Generating overwrites the template's copy. Continue anyway?",
+                    "Target and template share a resource", MessageBoxButton.YesNo);
+                ClothLogger.LogWarning(
+                    $"Target and template both resolve to EACloth '{_targetEAClothEntry.Name}' " +
+                    $"(user chose {(sharedEc == MessageBoxResult.Yes ? "continue" : "cancel")}).");
+                if (sharedEc != MessageBoxResult.Yes) return;
+            }
+
             string newResourceName = NewResourceNameText.Text.Trim().ToLower();
             int precision = (int)PrecisionSlider.Value;
             ClothLogger.DebugMode = DebugCheckBox.IsChecked == true;
@@ -1099,8 +1160,14 @@ namespace MeshSetExtender.Windows
                     task.Update("Extracting target mesh vertices...");
                     int targetLodCount = _targetMeshSet.Lods.Count;
                     int templateLodCount = _templateClothWrappingParsed.MeshSections.Length;
-                    int lodCount = System.Math.Min(targetLodCount, templateLodCount);
+                    int lodCount = targetLodCount;
                     var targetLodVertexData = new ExtractedVertexData[lodCount][];
+
+                    if (templateLodCount < targetLodCount)
+                    {
+                        ClothLogger.LogWarning($"Template cloth has fewer LODs ({templateLodCount}) than target mesh ({targetLodCount}). Higher target LODs will reuse the highest available template LOD metadata.");
+                    }
+
                     for (int lod = 0; lod < lodCount; lod++)
                     {
                         try
@@ -1153,9 +1220,7 @@ namespace MeshSetExtender.Windows
                     
                     if (targetClothWrappingEntry != null)
                     {
-                        // Update ResMeta with correct content size (first 4 bytes = ByteSize)
-                        byte[] cwMeta = new byte[16];
-                        BitConverter.GetBytes((uint)adaptedClothWrappingBytes.Length).CopyTo(cwMeta, 0);
+                        byte[] cwMeta = BuildUpdatedResMeta(targetClothWrappingEntry, adaptedClothWrappingBytes.Length);
                         App.AssetManager.ModifyRes(targetClothWrappingEntry.ResRid, adaptedClothWrappingBytes, cwMeta);
                         ClothLogger.Log($"Replaced ClothWrapping: {targetClothWrappingEntry.Name}");
                     }
@@ -1168,9 +1233,7 @@ namespace MeshSetExtender.Windows
                     
                     if (targetEAClothEntry != null)
                     {
-                        // Update ResMeta with correct content size (first 4 bytes = ByteSize)
-                        byte[] eaMeta = new byte[16];
-                        BitConverter.GetBytes((uint)eaClothBytes.Length).CopyTo(eaMeta, 0);
+                        byte[] eaMeta = BuildUpdatedResMeta(targetEAClothEntry, eaClothBytes.Length);
                         App.AssetManager.ModifyRes(targetEAClothEntry.ResRid, eaClothBytes, eaMeta);
                         ClothLogger.Log($"Replaced EACloth: {targetEAClothEntry.Name}");
                     }

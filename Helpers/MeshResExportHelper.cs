@@ -164,9 +164,14 @@ namespace MeshSetExtender.Helpers
                     data = reader.ReadToEnd();
             }
 
+            // ResMeta on the entry is the *base* metadata. For a modified res the live metadata
+            // (notably ByteSize) lives on ModifiedEntry — exporting the base copy produces a file
+            // whose header contradicts its payload.
+            byte[] meta = resEntry.ModifiedEntry?.ResMeta ?? resEntry.ResMeta;
+
             using (NativeWriter writer = new NativeWriter(new FileStream(outputPath, FileMode.Create)))
             {
-                writer.Write(resEntry.ResMeta);
+                writer.Write(meta);
                 writer.Write(data);
             }
         }

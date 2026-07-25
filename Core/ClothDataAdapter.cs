@@ -89,12 +89,29 @@ namespace MeshSetExtender.Core
                 throw new ArgumentException("Template cloth data has no mesh sections");
 
             var targetVertexData = targetLodVertexData[0]; // LOD0
-            int sectionCount = templateClothData.MeshSections.Length;
+            // Runtime safety: cloth LOD structure must follow the target mesh LOD structure.
+            // Using template-only extra LODs can produce valid files that crash in-game.
+            int sectionCount = targetLodVertexData.Length;
             var templateClothSection = templateClothData.MeshSections[0]; // LOD0
 
             bool hasTemplateMesh = templateVertexData != null && templateVertexData.Length > 0;
 
-            ClothLogger.Log($"Adapting cloth: {targetVertexData.Length} target verts, {templateClothSection.VertexCount} template verts, {sectionCount} LODs, precision={settings.Precision}");
+            // The template's cloth wrapping is indexed by template *mesh* vertex index, so the two
+            // must have the same vertex count. When they don't, the template cloth is not the one
+            // that belongs to this mesh — most often because a previous generation run overwrote a
+            // cloth res that the template and target share. Continuing silently clamps every
+            // out-of-range index onto the last cloth vertex and collapses the bone bindings.
+            if (hasTemplateMesh && templateClothSection.VertexCount != templateVertexData.Length)
+            {
+                ClothLogger.LogWarning(
+                    $"Template cloth wrapping has {templateClothSection.VertexCount} vertices but the template mesh has " +
+                    $"{templateVertexData.Length}. These normally match. Mesh vertex indices above " +
+                    $"{templateClothSection.VertexCount - 1} have no cloth vertex and will be clamped onto the last one, " +
+                    "which collapses bone bindings. This often means the template's cloth wrapping was overwritten by an " +
+                    "earlier generation run against a shared cloth resource.");
+            }
+
+            ClothLogger.Log($"Adapting cloth: {targetVertexData.Length} target verts, {templateClothSection.VertexCount} template verts, targetLODs={sectionCount}, templateLODs={templateClothData.MeshSections.Length}, precision={settings.Precision}");
             ClothLogger.LogDebug($"  Hash format: {settings.HashFormat}");
             ClothLogger.LogDebug($"  LOD0 bone weights: matched by position via {(hasTemplateMesh ? $"template mesh ({templateVertexData.Length} verts)" : "template cloth positions")} → cloth wrapping");
             ClothLogger.LogDebug($"  LOD0 normals/tangents: matched by normal direction via template mesh → cloth wrapping");
@@ -116,7 +133,8 @@ namespace MeshSetExtender.Core
             var adaptedLod0 = result.MeshSections[0];
             for (int lodIdx = 1; lodIdx < sectionCount; lodIdx++)
             {
-                var templateLodSection = templateClothData.MeshSections[lodIdx];
+                int templateLodIdx = System.Math.Min(lodIdx, templateClothData.MeshSections.Length - 1);
+                var templateLodSection = templateClothData.MeshSections[templateLodIdx];
 
                 // Check if we have target mesh vertex data for this LOD
                 ExtractedVertexData[] lodVertexData = (lodIdx < targetLodVertexData.Length && targetLodVertexData[lodIdx] != null)
@@ -134,7 +152,7 @@ namespace MeshSetExtender.Core
                 {
                     // No target mesh data for this LOD — copy from template
                     result.MeshSections[lodIdx] = CopySection(templateLodSection);
-                    ClothLogger.LogDebug($"  LOD{lodIdx}: copied from template ({templateLodSection.VertexCount} verts, no target LOD data)");
+                    ClothLogger.LogDebug($"  LOD{lodIdx}: copied from template LOD{templateLodIdx} ({templateLodSection.VertexCount} verts, no target LOD data)");
                 }
             }
 
@@ -212,6 +230,10 @@ namespace MeshSetExtender.Core
             var normalCache = new Dictionary<string, int>();
             string fmt = settings.HashFormat;
             int cacheHitsPos = 0, cacheHitsNorm = 0;
+            int clampedPos = 0, clampedNorm = 0;
+            float worstMatchDistSq = 0f;
+            double matchDistSqSum = 0;
+            int matchDistCount = 0;
 
             for (int i = 0; i < targetVertexData.Length; i++)
             {
@@ -229,8 +251,21 @@ namespace MeshSetExtender.Core
                     if (hasTemplateMesh)
                     {
                         closestPosIdx = FindClosestPositionInVertexData(targetVertexData[i].Position, templateVertexData);
+
+                        // How far the nearest template vertex actually is. This is the direct
+                        // measure of whether matching worked; a corrupt template makes it huge.
+                        float d = targetVertexData[i].Position.DistanceSquared(templateVertexData[closestPosIdx].Position);
+                        if (d > worstMatchDistSq) worstMatchDistSq = d;
+                        matchDistSqSum += d;
+                        matchDistCount++;
+
                         if (closestPosIdx >= templateClothSection.Vertices.Length)
+                        {
+                            // Behaviour preserved, but counted: every clamp here binds another
+                            // vertex to the same last cloth vertex.
                             closestPosIdx = templateClothSection.Vertices.Length - 1;
+                            clampedPos++;
+                        }
                     }
                     else
                     {
@@ -256,7 +291,10 @@ namespace MeshSetExtender.Core
                     {
                         closestNormalIdx = FindClosestNormalIndex(targetVertexData[i], templateVertexData);
                         if (closestNormalIdx >= templateClothSection.Vertices.Length)
+                        {
                             closestNormalIdx = templateClothSection.Vertices.Length - 1;
+                            clampedNorm++;
+                        }
                         normalCache[normHash] = closestNormalIdx;
                     }
                 }
@@ -288,7 +326,38 @@ namespace MeshSetExtender.Core
                     ClothLogger.LogDebug($"  LOD0: Processed {i}/{targetVertexData.Length} vertices...");
             }
 
-            ClothLogger.Log($"  LOD0: {targetVertexData.Length} vertices adapted (cache: {cacheHitsPos} pos hits/{positionCache.Count} unique, {cacheHitsNorm} normal hits/{normalCache.Count} unique)");
+            ClothLogger.Log($"  LOD0: {targetVertexData.Length} vertices adapted (dedup cache: {cacheHitsPos} pos hits/{positionCache.Count} unique, {cacheHitsNorm} normal hits/{normalCache.Count} unique)");
+
+            if (matchDistCount > 0)
+            {
+                double meanDist = System.Math.Sqrt(matchDistSqSum / matchDistCount);
+                double worstDist = System.Math.Sqrt(worstMatchDistSq);
+                string quality = worstDist > 1.0
+                    ? " -- TEMPLATE DOES NOT MATCH TARGET, check the template mesh for corrupt vertex data"
+                    : "";
+                ClothLogger.Log(
+                    $"  LOD0: nearest-template-vertex distance mean={meanDist:F4}, worst={worstDist:F4} " +
+                    $"over {matchDistCount} lookups{quality}");
+            }
+
+            if (clampedPos > 0 || clampedNorm > 0)
+            {
+                ClothLogger.LogWarning(
+                    $"  LOD0: {clampedPos} position and {clampedNorm} normal lookups fell outside the template cloth " +
+                    $"wrapping and were clamped onto its last vertex. Those vertices share one binding.");
+            }
+
+            // Distinct bone bindings is the direct health measure: a good adaptation produces
+            // hundreds or thousands, a collapsed one produces a handful.
+            var distinctBindings = new HashSet<string>();
+            foreach (var cv in section.Vertices)
+                distinctBindings.Add($"{cv.Index0},{cv.Index1},{cv.Index2},{cv.Index3}");
+
+            string verdict = distinctBindings.Count < System.Math.Max(8, targetVertexData.Length / 100)
+                ? " -- SUSPICIOUSLY LOW, cloth will likely render wrong"
+                : "";
+            ClothLogger.Log($"  LOD0: {distinctBindings.Count} distinct bone bindings across {targetVertexData.Length} vertices{verdict}");
+
             return section;
         }
 
@@ -530,18 +599,48 @@ namespace MeshSetExtender.Core
             ClothLogger.LogDebug($"  Chunk: {chunkLength} bytes, VertexBufferSize={lod.VertexBufferSize}, IndexBufferSize={lod.IndexBufferSize}, vertexBufferStart={vertexBufferStart}");
             ClothLogger.LogDebug($"  LOD{lodIndex} sections: {lod.Sections.Count}, IndexUnitSize={lod.IndexUnitSize}");
 
+            // The engine's per-LOD vertex index follows buffer layout (VertexOffset), not the
+            // order sections happen to be declared in. Those disagree on some LODs of composite
+            // meshes, which silently phase-shifts the cloth data. Sort by VertexOffset; OrderBy
+            // is stable, so declared order still breaks ties.
+            var orderedSections = lod.Sections
+                .Where(s => !string.IsNullOrEmpty(s.Name) && s.VertexCount != 0)
+                .OrderBy(s => s.VertexOffset)
+                .ToList();
+
+            if (!orderedSections.SequenceEqual(lod.Sections.Where(s => !string.IsNullOrEmpty(s.Name) && s.VertexCount != 0)))
+            {
+                ClothLogger.LogWarning(
+                    $"  LOD{lodIndex}: section declaration order does not match buffer order; " +
+                    $"reordered to {string.Join(", ", orderedSections.Select(s => $"{s.Name}@{s.VertexOffset}"))}");
+            }
+
             using (var reader = new NativeReader(chunkStream))
             {
-                foreach (var section in lod.Sections)
+                foreach (var section in orderedSections)
                 {
-                    // Skip non-renderable sections (depth/shadow with no name)
-                    if (string.IsNullOrEmpty(section.Name))
-                        continue;
-
-                    if (section.VertexCount == 0)
-                        continue;
 
                     var geomDecl = section.GeometryDeclDesc[0];
+
+                    // Full geometry declaration. The reads below assume a single interleaved
+                    // stream starting at VertexOffset; if positions live in a second stream, or a
+                    // later GeometryDeclDesc applies, that assumption is wrong and positions
+                    // decode to garbage while same-stream fields still look fine.
+                    if (ClothLogger.DebugMode)
+                    {
+                        ClothLogger.LogDebug($"    GeomDecl: {section.GeometryDeclDesc.Length} declaration(s), using [0] with {geomDecl.ElementCount} element(s)");
+                        for (int e = 0; e < geomDecl.ElementCount; e++)
+                        {
+                            var el = geomDecl.Elements[e];
+                            ClothLogger.LogDebug($"      element[{e}]: usage={el.Usage}, format={el.Format}, offset={el.Offset}, stream={el.StreamIndex}");
+                        }
+                        for (int st = 0; st < geomDecl.Streams.Length; st++)
+                        {
+                            var strm = geomDecl.Streams[st];
+                            if (strm.VertexStride == 0) continue;
+                            ClothLogger.LogDebug($"      stream[{st}]: stride={strm.VertexStride}, classification={strm.Classification}");
+                        }
+                    }
 
                     // Find position element
                     int posOffset = -1;
@@ -678,6 +777,36 @@ namespace MeshSetExtender.Core
                     {
                         var dbg = vertexData[startIdx + d];
                         ClothLogger.LogDebug($"    v[{d}]: pos=({dbg.Position.X:F6}, {dbg.Position.Y:F6}, {dbg.Position.Z:F6}), normal=({dbg.NormalX:F4}, {dbg.NormalY:F4}, {dbg.NormalZ:F4})");
+
+                        // Raw bytes for the same vertex. When the decoded position looks wrong,
+                        // this distinguishes "the buffer really holds this" from "we decoded it wrong".
+                        long rawStart = vertexBufferStart + section.VertexOffset + (d * vertexStride);
+                        int rawLen = System.Math.Min(vertexStride, (int)(chunkLength - rawStart));
+                        if (rawStart >= 0 && rawLen > 0)
+                        {
+                            reader.Position = rawStart;
+                            byte[] raw = reader.ReadBytes(rawLen);
+                            ClothLogger.LogDebug($"      raw @{rawStart} ({rawLen}B): {BitConverter.ToString(raw).Replace('-', ' ')}");
+                        }
+                    }
+
+                    // Sanity check: how much of this section actually decoded to usable positions?
+                    int degenerate = 0;
+                    for (int d = 0; d < (int)section.VertexCount; d++)
+                    {
+                        var p = vertexData[startIdx + d].Position;
+                        if ((p.X == 0f && p.Z == 0f) ||
+                            float.IsNaN(p.X) || float.IsNaN(p.Y) || float.IsNaN(p.Z) ||
+                            System.Math.Abs(p.X) > 1e6f || System.Math.Abs(p.Y) > 1e6f || System.Math.Abs(p.Z) > 1e6f)
+                        {
+                            degenerate++;
+                        }
+                    }
+                    if (degenerate > 0)
+                    {
+                        ClothLogger.LogWarning(
+                            $"    Section '{section.Name}': {degenerate}/{section.VertexCount} vertices decoded to " +
+                            $"degenerate positions (zero/NaN/out-of-range). Position matching will not work against this mesh.");
                     }
                 }
             }
